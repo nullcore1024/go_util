@@ -1,0 +1,15 @@
+syntax = "proto2";
+
+package hello;
+
+message HelloRequest {
+        optional string str = 1;
+}
+
+message HelloReply {
+        optional string str = 1;
+}
+
+service Echo {
+    rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
