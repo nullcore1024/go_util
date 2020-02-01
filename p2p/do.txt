@@ -1,0 +1,903 @@
+P2P穿透UDP/TCP--原理与实践篇(2篇) .
+
+(一) P2P 之 UDP穿透NAT的原理与实现（附源代码）
+参考：http://midcom-p2p.sourceforge.net/draft-ford-midcom-p2p-01.txt
+
+ 
+
+论坛上经常有对P2P原理的讨论，但是讨论归讨论，很少有实质的东西产生（源代码）。呵呵，在这里我就用自己实现的一个源代码来说明UDP穿越NAT的原理。
+
+首先先介绍一些基本概念：
+    NAT(Network Address Translators)，网络地址转换：网络地址转换是在IP地址日益缺乏的情况下产生的，它的主要目的就是为了能够地址重用。NAT分为两大类，基本的NAT和NAPT(Network Address/Port Translator)。
+    最开始NAT是运行在路由器上的一个功能模块。
+   
+    最先提出的是基本的NAT，它的产生基于如下事实：一个私有网络（域）中的节点中只有很少的节点需要与外网连接（呵呵，这是在上世纪90年代中期提出的）。那么这个子网中其实只有少数的节点需要全球唯一的IP地址，其他的节点的IP地址应该是可以重用的。
+    因此，基本的NAT实现的功能很简单，在子网内使用一个保留的IP子网段，这些IP对外是不可见的。子网内只有少数一些IP地址可以对应到真正全球唯一的IP地址。如果这些节点需要访问外部网络，那么基本NAT就负责将这个节点的子网内IP转化为一个全球唯一的IP然后发送出去。(基本的NAT会改变IP包中的原IP地址，但是不会改变IP包中的端口)
+    关于基本的NAT可以参看RFC 1631
+   
+    另外一种NAT叫做NAPT，从名称上我们也可以看得出，NAPT不但会改变经过这个NAT设备的IP数据报的IP地址，还会改变IP数据报的TCP/UDP端口。基本NAT的设备可能我们见的不多（呵呵，我没有见到过），NAPT才是我们真正讨论的主角。看下图：
+                                Server S1                        
+                         18.181.0.31:1235                         
+                                      |
+          ^  Session 1 (A-S1)  ^      | 
+          |  18.181.0.31:1235  |      |  
+          v 155.99.25.11:62000 v      |   
+                                      |
+                                     NAT
+                                 155.99.25.11
+                                      |
+          ^  Session 1 (A-S1)  ^      | 
+          |  18.181.0.31:1235  |      | 
+          v   10.0.0.1:1234    v      | 
+                                      |
+                                   Client A
+                                10.0.0.1:1234
+    有一个私有网络10.*.*.*，Client A是其中的一台计算机，这个网络的网关（一个NAT设备）的外网IP是155.99.25.11(应该还有一个内网的IP地址，比如10.0.0.10)。如果Client A中的某个进程（这个进程创建了一个UDP Socket,这个Socket绑定1234端口）想访问外网主机18.181.0.31的1235端口，那么当数据包通过NAT时会发生什么事情呢？
+    首先NAT会改变这个数据包的原IP地址，改为155.99.25.11。接着NAT会为这个传输创建一个Session（Session是一个抽象的概念，如果是TCP，也许Session是由一个SYN包开始，以一个FIN包结束。而UDP呢，以这个IP的这个端口的第一个UDP开始，结束呢，呵呵，也许是几分钟，也许是几小时，这要看具体的实现了）并且给这个Session分配一个端口，比如62000，然后改变这个数据包的源端口为62000。所以本来是（10.0.0.1:1234->18.181.0.31:1235）的数据包到了互联网上变为了（155.99.25.11:62000->18.181.0.31:1235）。
+    一旦NAT创建了一个Session后，NAT会记住62000端口对应的是10.0.0.1的1234端口，以后从18.181.0.31发送到62000端口的数据会被NAT自动的转发到10.0.0.1上。（注意：这里是说18.181.0.31发送到62000端口的数据会被转发，其他的IP发送到这个端口的数据将被NAT抛弃）这样Client A就与Server S1建立以了一个连接。
+
+    呵呵，上面的基础知识可能很多人都知道了，那么下面是关键的部分了。
+    看看下面的情况：
+    Server S1                                     Server S2
+ 18.181.0.31:1235                              138.76.29.7:1235
+        |                                             |
+        |                                             |
+        +----------------------+----------------------+
+                               |
+   ^  Session 1 (A-S1)  ^      |      ^  Session 2 (A-S2)  ^
+   |  18.181.0.31:1235  |      |      |  138.76.29.7:1235  |
+   v 155.99.25.11:62000 v      |      v 155.99.25.11:62000 v
+                               |
+                            Cone NAT
+                          155.99.25.11
+                               |
+   ^  Session 1 (A-S1)  ^      |      ^  Session 2 (A-S2)  ^
+   |  18.181.0.31:1235  |      |      |  138.76.29.7:1235  |
+   v   10.0.0.1:1234    v      |      v   10.0.0.1:1234    v
+                               |
+                            Client A
+                         10.0.0.1:1234
+    接上面的例子，如果Client A的原来那个Socket(绑定了1234端口的那个UDP Socket)又接着向另外一个Server S2发送了一个UDP包，那么这个UDP包在通过NAT时会怎么样呢？
+    这时可能会有两种情况发生，一种是NAT再次创建一个Session，并且再次为这个Session分配一个端口号（比如：62001）。另外一种是NAT再次创建一个Session，但是不会新分配一个端口号，而是用原来分配的端口号62000。前一种NAT叫做Symmetric NAT，后一种叫做Cone NAT。我们期望我们的NAT是第二种，呵呵，如果你的NAT刚好是第一种，那么很可能会有很多P2P软件失灵。（可以庆幸的是，现在绝大多数的NAT属于后者，即Cone NAT）
+  
+    好了，我们看到，通过NAT,子网内的计算机向外连结是很容易的（NAT相当于透明的，子网内的和外网的计算机不用知道NAT的情况）。
+    但是如果外部的计算机想访问子网内的计算机就比较困难了（而这正是P2P所需要的）。
+    那么我们如果想从外部发送一个数据报给内网的计算机有什么办法呢？首先，我们必须在内网的NAT上打上一个“洞”（也就是前面我们说的在NAT上建立一个Session），这个洞不能由外部来打，只能由内网内的主机来打。而且这个洞是有方向的，比如从内部某台主机（比如：192.168.0.10）向外部的某个IP(比如：219.237.60.1)发送一个UDP包，那么就在这个内网的NAT设备上打了一个方向为219.237.60.1的“洞”，（这就是称为UDP Hole Punching的技术）以后219.237.60.1就可以通过这个洞与内网的192.168.0.10联系了。（但是其他的IP不能利用这个洞）。
+
+
+ （219.237.60.1）
+                          |
+                          |
+   +----------------------+----------------------+
+   |                                             |
+ NAT A (外网IP:202.187.45.3)                 NAT B (外网IP:187.34.1.56)
+   |   (内网IP:192.168.0.1)                      | (内网IP:192.168.0.1)
+   |                                             |
+Client A  (192.168.0.20:4000)             Client B (192.168.0.10:40000)
+
+    首先，Client A登录服务器，NAT A为这次的Session分配了一个端口60000，那么Server S收到的Client A的地址是202.187.45.3:60000，这就是Client A的外网地址了。同样，Client B登录Server S，NAT B给此次Session分配的端口是40000，那么Server S收到的B的地址是187.34.1.56:40000。
+    此时，Client A与Client B都可以与Server S通信了。如果Client A此时想直接发送信息给Client B，那么他可以从Server S那儿获得B的公网地址187.34.1.56:40000，是不是Client A向这个地址发送信息Client B就能收到了呢？答案是不行，因为如果这样发送信息，NAT B会将这个信息丢弃（因为这样的信息是不请自来的，为了安全，大多数NAT都会执行丢弃动作）。现在我们需要的是在NAT B上打一个方向为202.187.45.3（即Client A的外网地址）的洞，那么Client A发送到187.34.1.56:40000的信息,Client B就能收到了。这个打洞命令由谁来发呢，呵呵，当然是Server S。
+    总结一下这个过程：如果Client A想向Client B发送信息，那么Client A发送命令给Server S，请求Server S命令Client B向Client A方向打洞。呵呵，是不是很绕口，不过没关系，想一想就很清楚了，何况还有源代码呢（侯老师说过：在源代码面前没有秘密 8）），然后Client A就可以通过Client B的外网地址与Client B通信了。
+   
+    注意：以上过程只适合于Cone NAT的情况，如果是Symmetric NAT，那么当Client B向Client A打洞的端口已经重新分配了，Client B将无法知道这个端口（如果Symmetric NAT的端口是顺序分配的，那么我们或许可以猜测这个端口号，可是由于可能导致失败的因素太多，我们不推荐这种猜测端口的方法）。
+   
+    下面是一个模拟P2P聊天的过程的源代码，过程很简单，P2PServer运行在一个拥有公网IP的计算机上，P2PClient运行在两个不同的NAT后（注意，如果两个客户端运行在一个NAT后，本程序很可能不能运行正常，这取决于你的NAT是否支持loopback translation，详见http://midcom-p2p.sourceforge.net/draft-ford-midcom-p2p-01.txt，当然，此问题可以通过双方先尝试连接对方的内网IP来解决，但是这个代码只是为了验证原理，并没有处理这些问题），后登录的计算机可以获得先登录计算机的用户名，后登录的计算机通过send username message的格式来发送消息。如果发送成功，说明你已取得了直接与对方连接的成功。
+    程序现在支持三个命令：send , getu , exit
+   
+    send格式：send username message
+    功能：发送信息给username
+   
+    getu格式：getu
+    功能：获得当前服务器用户列表
+   
+    exit格式：exit
+    功能：注销与服务器的连接（服务器不会自动监测客户是否吊线）
+       
+    代码很短，相信很容易懂，如果有什么问题，可以给我发邮件zhouhuis22@sina.com  或者在CSDN上发送短消息。同时，欢迎转发此文，但希望保留作者版权8-）。
+   
+    最后感谢CSDN网友 PiggyXP 和 Seilfer的测试帮助
+
+P2PServer.c
+
+/* P2P 程序服务端
+ *
+ * 文件名：P2PServer.c
+ *
+ * 日期：2004-5-21
+ *
+ * 作者：shootingstars(zhouhuis22@sina.com)
+ *
+ */
+#pragma comment(lib, "ws2_32.lib")
+
+#include "windows.h"
+#include "../proto.h"
+#include "../Exception.h"
+
+UserList ClientList;
+
+void InitWinSock()
+{
+ WSADATA wsaData;
+
+ if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+ {
+  printf("Windows sockets 2.2 startup");
+  throw Exception("");
+ }
+ e     }
+    case LOGOUT:
+     {
+      // 将此客户信息删除
+      
+	呵呵，现在erIterator!=ClientList.end();
+       ++UserIterator)
+      {
+       if( strcmp( ((*UserIterator)->userName), recvbuf.message.logoutmember.userName) == 0 )
+       {
+        removeiterator = UserIterator;
+        break;
+       }
+      }
+      if(rem轮到我们的正题P2P了。有了上面的理论，实现两个内网的主机通讯就差最后一步了：那就是鸡生蛋还是蛋生鸡的问题了，两边都无法主动发出连接请求，谁
+veiterator != NULL)
+       ClientList.remove(*removeiterator);
+      break;
+     }
+    case P2PTRANS:
+     {
+      // 某个客户希望服务端向另外一个客户发送一个打洞消息
+      printf("%s wants to p2p %s/n",inet_ntoa(sender.sin_addr),recvbuf.message.translatemessage.userName);
+      stUserListNode node = GetUser(recvbuf.message.translatemessage.userName);
+      sockaddr_in remote;
+      remote.sin_family=AF_INET;
+      remote.sin_port= htons(node.port);
+      remote.sin_addr.s_addr = htonl(node.ip);
+
+      in_addr tmp;
+      tmp.S_un.S_addr = htonl(node.ip);
+      printf("the address is %s,and port is %d/n",inet_ntoa(tmp), node.port);
+
+      stP2PMessage transMessage;
+      transMessage.iMessageType = P2PSOMEONEWANTTOCALLYOU;
+      transMessage.iStringLen = ntohl(sender.sin_addr.S_un.S_addr);
+      transMessage.Port = ntohs(sender.sin_port);
+                       
+      sendto(PrimaryUDP,(const char*)&transMessage, sizeof(transMessage), 0, (const sockaddr *)&remote, sizeof(remote));
+
+   
+	ek;
+     }
+    
+    case GETALLUSER:
+     {
+      int command = GETALLUSER;
+      sendto(PrimaryUDP, (const char*)&command, sizeof(int), 0, (const sockaddr*)&sender, sizeof(sender));
+
+      int nodecount = (int)ClientList.size();
+      sendto(PrimaryUDP, (const char*)&nodecount, sizeof(int), 0, (const sockaddr*)&sender, sizeof(sender));
+
+      for(UserList::iterator UserIterator=ClientList.begin();
+        UserIterator!=ClientList.end();
+        ++UserIterator)
+      {
+       sendto(PrimaryUDP, (const char*)(*UserIterator), sizeof(stUserListNode), 0, (const sockaddr*)&sender, sizeof(sender));
+      }
+      break;
+     }
+    }
+   }
+  }
+
+ }
+ catch(Exception &e)
+ {
+  printf(e.GetMessage());
+  return 1;
+ }
+
+ return 0;
+}
+
+/* P2P 程序客户端
+ *
+ * 文件名：P2PClient.c
+ *
+ * 日期：2004-5-21
+ *
+ * 作者：shootingstars(zhouhuis22@sina.com)
+ *
+ */
+
+#pragma comment(lib,"ws2_32.lib")
+
+#include "windows.h"
+#include "../proto.h"
+#include "../Exception.h"
+#include <iostream>
+using namespace std;
+
+UserList ClientList;
+
+ 
+
+#define COMMANDMAXC 256
+#define MAXRETRY    5
+
+SOCKET PrimaryUDP;
+char UserName[10];
+char ServerIP[20];
+
+bool RecvedACK;
+
+void InitWinSock()
+{
+ WSADATA wsaData;
+
+ if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+ {
+  printf("Windows sockets 2k;
+     }
+    
+    case GETALLUSER:
+     {
+      int command = GETALLUSER;
+      sendto(PrimaryUDP, (const char*)&command, sizeof(int), 0, (const sockaddr*)&sender, sizeof(sender));
+
+      int nodecount = (int)ClientList.size();
+      sendto(PrimaryUDP, (const char*)&nodecount, sizeof(int), 0, (const sockaddr*)&sender, sizeof(sender));
+
+      for(UserList::iterator UserIterator=ClientList.begin();
+        UserIterator!=ClientList.end();
+        ++UserIterator)
+      {
+       sendto(PrimaryUDP, (const char*)(*UserIterator), sizeof(stUserListNode), 0, (const sockaddr*)&sender, sizeof(sender));
+      }
+      break;
+     }
+    }
+   }
+  }
+
+ }
+ catch(Exception &e)
+ {
+  printf(e.GetMessage());
+  return 1;
+ }
+
+ return 0;
+}
+
+/* P2P 程序客户端
+ *
+ * 文件名：P2PClient.c
+ *
+ * 日期：2004-5-21
+ *
+ * 作者：shootingstars(zhouhuis22@sina.com)
+ *
+ */
+
+#pragma comment(lib,"ws2_32.lib")
+
+ghVersion), HIBYTE(wsaData.wHighVersion));
+ }
+}
+
+SOCKET mksock(int type)
+{
+ SOCKET sock = socket(AF_INET, type, 0);
+ if (sock < 0)
+ {
+        printf("create socket error");
+  throw Exception("");
+ }
+ return sock;
+}
+
+stUserListNode GetUser(char *username)
+{
+ for(UserList::iterator UserIterator=ClientList.begin();
+      UserIterator!=ClientList.end();
+       ++UserIterator)
+ {
+  if( strcmp( ((*UserIterator)->userName), username) == 0 )
+   return *(*UserIterator);
+ }
+ throw Exception("not find this user");
+}
+
+void BindSock(SOCKET sock)
+{
+ sockaddr_in sin;
+ sin.sin_addr.S_un.S_addr = INADDR_ANY;
+ sin.sin_family = AF_INET;
+ sin.sin_port = 0;
+ 
+ if (bind(sock, (struct sockaddr*)&sin, sizeof(sin)) < 0)
+  throw Exception("bind error");
+}
+
+void ConnectToServer(SOCKET sock,char *username, char *serverip)
+{
+ sockaddr_in remote;
+ remote.sin_addr.S_un.S_addr = inet_addr(serverip);
+ remote.sin_family = AF_INET;
+ remote.sin_port = htons(SERVER_PORT);
+ 
+ stMessage sendbuf;
+ sendbuf.iMessageType = LOGIN;
+ strncpy(sendbuf.message.loginmember.userName, username, 10);
+
+ sendto(sock, (const char*)&sendbuf, sizeof(sendbuf), 0, (const sockaddr*)&remote,sizeof(remote));
+
+ int usercount;
+ int fromlen = sizeof(remote);
+ int iread = recvfrom(sock, (char *)&usercount, sizeof(int), 0, (sockaddr *)&remote, &fromlen);
+ if(iread<=0)
+ {
+  throw Exception("Login error/n");
+ }
+
+ // 登录到服务端后，接收服务端发来的已经登录的用户的信息
+ cout<<"Have "<<usercount<<" users logined server:"<<endl;
+ for(int i = 0;i<usercount;i++)
+ {
+  stUserListNode *node = new stUserListNode;
+  recvfrom(sock, (char*)node, sizeof(stUserListNode), 0, (sockaddr *)&remote, &fromlen);
+  ClientList.push_back(node);
+  cout<<"Username:"<<node->userName<<endl;
+  in_addr tmp;
+  tmp.S_un.S_addr = htonl(node->ip);
+  cout<<"UserIP:"<<inet_ntoa(tmp)<<endl;
+  cout<<"UserPort:"<<node->port<<endl;
+  cout<<""<<endl;
+ }
+}
+
+void OutputUsage()
+{
+ cout<<"You can input you command:/n"
+  <<"Command Type:/"send/",/"exit/",/"getu/"/n"
+  <<"Example : send Username Message/n"
+  <<"          exit/n"
+  <<"          getu/n"
+  <<endl;
+}
+
+/* 这是主要的函数：发送一个消息给某个用户(C)
+ *流程：直接向某个用户的外网IP发送消息，如果此前没有联系过
+ *      那么此消息将无法发送，发送端等待超时。
+ *      超时后，发送端将发送一个请求信息到服务端，
+ *      要求服务端发送给客户C一个请求，请求C给本机发送打洞消息
+ *      以上流程将重复MAXRETRY次
+ */
+bool SendMessageTo(char *UserName, char *Message)
+{
+ char realmessage[256];
+ unsigned int UserIP;
+ unsigned short UserPort;
+ bool FindUser = false;
+ for(UserList::iterator UserIterator=ClientList.begin();
+      UserIterator!=ClientList.end();
+      ++UserIterator)
+ {
+  if( strcmp( ((*UserIterator)->userName), UserName) == 0 )
+  {
+   UserIP = (*UserIterator)->ip;
+   UserPort = (*UserIterator)->port;
+   FindUser = true;
+  }
+ }
+
+ if(!FindUser)
+  return false;
+
+ strcpy(realmessage, Message);
+ for(int i=0;i<MAXRETRY;i++)
+ {
+  RecvedACK = false;
+
+  sockaddr_in remote;
+  remote.sin_addr.S_un.S_addr = htonl(UserIP);
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(UserPort);
+  stP2PMessage MessageHead;
+  MessageHead.iMessageType = P2PMESSAGE;
+  MessageHead.iStringLen = (int)strlen(realmessage)+1;
+  int isend = sendto(PrimaryUDP, (const char *)&MessageHead, sizeof(MessageHead), 0, (const sockaddr*)&remote, sizeof(remote));
+  isend = sendto(PrimaryUDP, (const char *)&realmessage, MessageHead.iStringLen, 0, (const sockaddr*)&remote, sizeof(remote));
+  
+  // 等待接收线程将此标记修改
+  for(int j=0;j<10;j++)
+  {
+   if(RecvedACK)
+    return true;
+   else
+    Sleep(300);
+  }
+
+  // 没有接收到目标主机的回应，认为目标主机的端口映射没有
+  // 打开，那么发送请求信息给服务器，要服务器告诉目标主机
+  // 打开映射端口（UDP打洞）
+  sockaddr_in server;
+  server.sin_addr.S_un.S_addr = inet_addr(ServerIP);
+  server.sin_family = AF_INET;
+  server.sin_port = htons(SERVER_PORT);
+ 
+  stMessage transMessage;
+  transMessage.iMessageType = P2PTRANS;
+  strcpy(transMessage.message.translatemessage.userName, UserName);
+
+  sendto(PrimaryUDP, (const char*)&transMessage, sizeof(transMessage), 0, (const sockaddr*)&server, sizeof(server));
+  Sleep(100);// 等待对方先发送信息。
+ }
+ return false;
+}
+
+// 解析命令，暂时只有exit和send命令
+// 新增getu命令，获取当前服务器的所有用户
+void ParseCommand(char * CommandLine)
+{
+ if(strlen(CommandLine)<4)
+  return;
+ char Command[10];
+ strncpy(Command, CommandLine, 4);
+ Command[4]='/0';
+
+ if(strcmp(Command,"exit")==0)
+ {
+  stMessage sendbuf;
+  sendbuf.iMessageType = LOGOUT;
+  strncpy(sendbuf.message.logoutmember.userName, UserName, 10);
+  sockaddr_in server;
+  server.sin_addr.S_un.S_addr = inet_addr(ServerIP);
+  server.sin_family = AF_INET;
+  server.sin_port = htons(SERVER_PORT);
+
+  sendto(PrimaryUDP,(const char*)&sendbuf, sizeof(sendbuf), 0, (const sockaddr *)&server, sizeof(server));
+  shutdown(PrimaryUDP, 2);
+  closesocket(PrimaryUDP);
+  exit(0);
+ }
+ else if(strcmp(Command,"send")==0)
+ {
+  char sendname[20];
+  char message[COMMANDMAXC];
+  int i;
+  for(i=5;;i++)
+  {
+   if(CommandLine[i]!=' ')
+    sendname[i-5]=CommandLine[i];
+   else
+   {
+    sendname[i-5]='/0';
+    break;
+   }
+  }
+  strcpy(message, &(CommandLine[i+1]));
+  if(SendMessageTo(sendname, message))
+   printf("Send OK!/n");
+  else
+   printf("Send Failure!/n");
+ }
+ else if(strcmp(Command,"getu")==0)
+ {
+  int command = GETALLUSER;
+  sockaddr_in server;
+  server.sin_addr.S_un.S_addr = inet_addr(ServerIP);
+  server.sin_family = AF_INET;
+  server.sin_port = htons(SERVER_PORT);
+
+  sendto(PrimaryUDP,(const char*)&command, sizeof(command), 0, (const sockaddr *)&server, sizeof(server));
+ }
+}
+
+// 接受消息线程
+DWORD WINAPI RecvThreadProc(LPVOID lpParameter)
+{
+ sockaddr_in remote;
+ int sinlen = sizeof(remote);
+ stP2PMessage recvbuf;
+ for(;;)
+ {
+  int iread = recvfrom(PrimaryUDP, (char *)&recvbuf, sizeof(recvbuf), 0, (sockaddr *)&remote, &sinlen);
+  if(iread<=0)
+  {
+   printf("recv error/n");
+   continue;
+  }
+  switch(recvbuf.iMessageType)
+  {
+  case P2PMESSAGE:
+   {
+    // 接收到P2P的消息
+    char *comemessage= new char[recvbuf.iStringLen];
+    int iread1 = recvfrom(PrimaryUDP, comemessage, 256, 0, (sockaddr *)&remote, &sinlen);
+    comemessage[iread1-1] = '/0';
+    if(iread1<=0)
+     throw Exception("Recv Message Error/n");
+    else
+    {
+     printf("Recv a Message:%s/n",comemessage);
+     
+     stP2PMessage sendbuf;
+     sendbuf.iMessageType = P2PMESSAGEACK;
+     sendto(PrimaryUDP, (const char*)&sendbuf, sizeof(sendbuf), 0, (const sockaddr*)&remote, sizeof(remote));
+    }
+
+    delete []comemessage;
+    break;
+
+   }
+  case P2PSOMEONEWANTTOCALLYOU:
+   {
+    // 接收到打洞命令，向指定的IP地址打洞
+    printf("Recv p2someonewanttocallyou data/n");
+    sockaddr_in remote;
+    remote.sin_addr.S_un.S_addr = htonl(recvbuf.iStringLen);
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(recvbuf.Port);
+
+    // UDP hole punching
+    stP2PMessage message;
+    message.iMessageType = P2PTRASH;
+    sendto(PrimaryUDP, (const char *)&message, sizeof(message), 0, (const sockaddr*)&remote, sizeof(remote));
+               
+    break;
+   }
+  case P2PMESSAGEACK:
+   {
+    // 发送消息的应答
+    RecvedACK = true;
+    break;
+   }
+  case P2PTRASH:
+   {
+    // 对方发送的打洞消息，忽略掉。
+    //do nothing ...
+    printf("Recv p2ptrash data/n");
+    break;
+   }
+  case GETALLUSER:
+   {
+    int usercount;
+    int fromlen = sizeof(remote);
+    int iread = recvfrom(PrimaryUDP, (char *)&usercount, sizeof(int), 0, (sockaddr *)&remote, &fromlen);
+    if(iread<=0)
+    {
+     throw Exception("Login error/n");
+    }
+    
+    ClientList.clear();
+
+    cout<<"Have "<<usercount<<" users logined server:"<<endl;
+    for(int i = 0;i<usercount;i++)
+    {
+     stUserListNode *node = new stUserListNode;
+     recvfrom(PrimaryUDP, (char*)node, sizeof(stUserListNode), 0, (sockaddr *)&remote, &fromlen);
+     ClientList.push_back(node);
+     cout<<"Username:"<<node->userName<<endl;
+     in_addr tmp;
+     tmp.S_un.S_addr = htonl(node->ip);
+     cout<<"UserIP:"<<inet_ntoa(tmp)<<endl;
+     cout<<"UserPort:"<<node->port<<endl;
+     cout<<""<<endl;
+    }
+    break;
+   }
+  }
+ }
+}
+
+
+int main(int argc, char* argv[])
+{
+ try
+ {
+  InitWinSock();
+  
+  PrimaryUDP = mksock(SOCK_DGRAM);
+  BindSock(PrimaryUDP);
+
+  cout<<"Please input server ip:";
+  cin>>ServerIP;
+
+  cout<<"Please input your name:";
+  cin>>UserName;
+
+  ConnectToServer(PrimaryUDP, UserName, ServerIP);
+
+  HANDLE threadhandle = CreateThread(NULL, 0, RecvThreadProc, NULL, NULL, NULL);
+  CloseHandle(threadhandle);
+  OutputUsage();
+
+  for(;;)
+  {
+   char Command[COMMANDMAXC];
+   gets(Command);
+   ParseCommand(Command);
+  }
+ }
+ catch(Exception &e)
+ {
+  printf(e.GetMessage());
+  return 1;
+ }
+ return 0;
+}
+
+/* 异常类
+ *
+ * 文件名：Exception.h
+ *
+ * 日期：2004.5.5
+ *
+ * 作者：shootingstars(zhouhuis22@sina.com)
+ */
+
+#ifndef __HZH_Exception__
+#define __HZH_Exception__
+
+#define EXCEPTION_MESSAGE_MAXLEN 256
+#include "string.h"
+
+class Exception
+{
+private:
+ char m_ExceptionMessage[EXCEPTION_MESSAGE_MAXLEN];
+public:
+ Exception(char *msg)
+ {
+  strncpy(m_ExceptionMessage, msg, EXCEPTION_MESSAGE_MAXLEN);
+ }
+
+ char *GetMessage()
+ {
+  return m_ExceptionMessage;
+ }
+};
+
+#endif
+
+/* P2P 程序传输协议
+ *
+ * 日期：2004-5-21
+ *
+ * 作者：shootingstars(zhouhuis22@sina.com)
+ *
+ */
+
+#pragma once
+#include <list>
+
+// 定义iMessageType的值
+#define LOGIN 1
+#define LOGOUT 2
+#define P2PTRANS 3
+#define GETALLUSER  4
+
+// 服务器端口
+#define SERVER_PORT 2280
+
+// Client登录时向服务器发送的消息
+struct stLoginMessage
+{
+ char userName[10];
+ char password[10];
+};
+
+// Client注销时发送的消息
+struct stLogoutMessage
+{
+ char userName[10];
+};
+
+// Client向服务器请求另外一个Client(userName)向自己方向发送UDP打洞消息
+struct stP2PTranslate
+{
+ char userName[10];
+};
+
+// Client向服务器发送的消息格式
+struct stMessage
+{
+ int iMessageType;
+ union _message
+ {
+  stLoginMessage loginmember;
+  stLogoutMessage logoutmember;
+  stP2PTranslate translatemessage;
+ }message;
+};
+
+// 客户节点信息
+struct stUserListNode
+{
+ char userName[10];
+ unsigned int ip;
+ unsigned short port;
+};
+
+// Server向Client发送的消息
+struct stServerToClient
+{
+ int iMessageType;
+ union _message
+ {
+  stUserListNode user;
+ }message;
+
+};
+
+//======================================
+// 下面的协议用于客户端之间的通信
+//======================================
+#define P2PMESSAGE 100               // 发送消息
+#define P2PMESSAGEACK 101            // 收到消息的应答
+#define P2PSOMEONEWANTTOCALLYOU 102  // 服务器向客户端发送的消息
+                                     // 希望此客户端发送一个UDP打洞包
+#define P2PTRASH        103          // 客户端发送的打洞包，接收端应该忽略此消息
+
+// 客户端之间发送消息格式
+struct stP2PMessage
+{
+ int iMessageType;
+ int iStringLen;         // or IP address
+ unsigned short Port;
+};
+
+using namespace std;
+typedef list<stUserListNode *> UserList;
+
+工程下载地址:upload/2004_05/04052509317298.rar
+
+(二) 源码下载: http://www.ppcn.net/upload/2005_08/05080112299104.rar 参考： http://midcom-p2p.sourceforge.net/draft-ford-midcom-p2p-01.txt
+
+P2P之UDP穿透NAT的原理与实现(shootingstars)
+
+文章说明:
+
+关于UDP穿透NAT的中文资料在网络上是很少的，仅有<<P2P之UDP穿透NAT的原理与实现(shootingstars)>>这篇文章有实际的参考价值。本人近两年来也一直从事P2P方面的开发工作，比较有代表性的是个人开发的BitTorrent下载软件 - FlashBT(变态快车). 对P2P下载或者P2P的开发感兴趣的朋友可以访问软件的官方主页: http://www.hwysoft.com/chs/ 下载看看，说不定有收获。写这篇文章的主要目的是懒的再每次单独回答一些网友的提问, 一次性写下来, 即节省了自己的时间，也方便了对于P2P的UDP穿透感兴趣的网友阅读和理解。对此有兴趣和经验的朋友可以给我发邮件或者访问我的个人Blog留言: http://hwycheng.blogchina.com. 您可以自由转载此篇文章，但是请保留此说明。
+
+再次感谢shootingstars网友的早期贡献. 表示谢意。
+
+NAT(The IP Network Address Translator) 的概念和意义是什么?
+
+NAT, 中文翻译为网络地址转换。具体的详细信息可以访问RFC 1631 - http://www.faqs.org/rfcs/rfc1631.html, 这是对于NAT的定义和解释的最权威的描述。网络术语都是很抽象和艰涩的，除非是专业人士，否则很难从字面中来准确理解NAT的含义。
+
+要想完全明白NAT 的作用，我们必须理解IP地址的两大分类，一类是私有IP地址，在这里我们称作内网IP地址。一类是非私有的IP地址，在这里我们称作公网IP地址。关于IP地址的概念和作用的介绍参见我的另一篇文章: http://hwycheng.blogchina.com/2402121.html
+
+内网IP地址: 是指使用A/B/C类中的私有地址, 分配的IP地址在全球不惧有唯一性，也因此无法被其它外网主机直接访问。公网IP地址: 是指具有全球唯一的IP地址，能够直接被其它主机访问的。
+
+NAT 最初的目的是为使用内网IP地址的计算机提供通过少数几台具有公网的IP地址的计算机访问外部网络的功能。NAT 负责将某些内网IP地址的计算机向外部网络发出的IP数据包的源IP地址转换为NAT自己的公网的IP地址，目的IP地址不变, 并将IP数据包转发给路由器，最终到达外部的计算机。同时负责将外部的计算机返回的IP数据包的目的IP地址转换为内网的IP地址，源IP地址不变，并最终送达到内网中的计算机。
+
+
+图一: NAT 实现了私有IP的计算机分享几个公网IP地址访问Internet的功能。
+
+随着网络的普及，IPv4的局限性暴露出来。公网IP地址成为一种稀缺的资源，此时NAT 的功能局限也暴露出来，同一个公网的IP地址，某个时间只能由一台私有IP地址的计算机使用。于是NAPT(The IP Network Address/Port Translator)应运而生，NAPT实现了多台私有IP地址的计算机可以同时通过一个公网IP地址来访问Internet的功能。这在很大程度上暂时缓解了IPv4地址资源的紧张。
+
+NAPT 负责将某些内网IP地址的计算机向外部网络发出的TCP/UDP数据包的源IP地址转换为NAPT自己的公网的IP地址，源端口转为NAPT自己的一个端口。目的IP地址和端口不变, 并将IP数据包发给路由器，最终到达外部的计算机。同时负责将外部的计算机返回的IP数据包的目的IP地址转换内网的IP地址，目的端口转为内网计算机的端口，源IP地址和源端口不变，并最终送达到内网中的计算机。
+
+图二: NAPT 实现了私有IP的计算机分享一个公网IP地址访问Internet的功能。
+
+在我们的工作和生活中, NAPT的作用随处可见，绝大部分公司的网络架构，都是通过1至N台支持NAPT的路由器来实现公司的所有计算机连接外部的Internet网络的。包括本人在写这篇文章的时候，也是在家中使用一台IBM笔记本通过一台宽带连接的台式机来访问Internet的。我们本篇文章主要讨论的NAPT的问题。
+
+NAPT(The IP Network Address/Port Translator) 为何阻碍了P2P软件的应用?
+
+通过NAPT 上网的特点决定了只能由NAPT内的计算机主动向NAPT外部的主机发起连接，外部的主机想直接和NAPT内的计算机直接建立连接是不被允许的。IM(即时通讯)而言，这意味着由于NAPT内的计算机和NAPT外的计算机只能通过服务器中转数据来进行通讯。对于P2P方式的下载程序而言，意味着NAPT内的计算机不能接收到NAPT外部的连接，导致连接数用过少，下载速度很难上去。因此P2P软件必须要解决的一个问题就是要能够在一定的程度上解决NAPT内的计算机不能被外部连接的问题。
+
+NAT(The IP Network Address Translator) 进行UDP穿透的原理是什么?
+
+TCP/IP传输时主要用到TCP和UDP协议。TCP协议是可靠的，面向连接的传输协议。UDP是不可靠的，无连接的协议。根据TCP和UDP协议的实现原理，对于NAPT来进行穿透，主要是指的UDP协议。TCP协议也有可能，但是可行性非常小，要求更高，我们此处不作讨论，如果感兴趣可以到Google上搜索，有些文章对è个问题做了探讨性的描述。下面我们来看看利用UDP协议来穿透NAPT的原理是什么:
+
+
+图三: NAPT 是如何将私有IP地址的UDP数据包与公网主机进行透明传输的。
+
+UDP协议包经NAPT透明传输的说明:
+
+NAPT为每一个Session分配一个NAPT自己的端口号，依据此端口号来判断将收到的公网IP主机返回的TCP/IP数据包转发给那台内网IP地址的计算机。在这里Session是虚拟的，UDP通讯并不需要建立连接，但是对于NAPT而言，的确要有一个Session的概念存在。NAPT对于UDP协议 包的透明传输面临的一个重要的问题就是如何处理这个虚拟的Session。我们都知道TCP连接的Session以SYN包开始，以FIN包结束，NAPT可以很容易的获取到TCP Session的生命周期，并进行处理。但是对于UDP而言，就麻烦了，NAPT并不知道转发出去的UDP协议包是否到达了目的主机，也没有办法知道。而且鉴于UDP协议的特点，可靠很差，因此NAPT必须强制维持Session的存在，以便等待将外部送回来的数据并转发给曾经发起请求的内网IP地址的计算机。NAPT具体如何处理UDP Session的超时呢？不同的厂商提供的设备对于NAPT的实现不近相同，也许几分钟，也许几个小时，些NAPT的实现还会根据设备的忙碌状态进行智能计算超时时间的长短。
+
+
+图四: NAPT 将内部发出的UDP协议包的源地址和源端口改变传输给公网IP主机。
+
+图五: NAPT 将收到的公网IP主æº返回的UDP协议包的目的地址和目的端口改变传输给内网IP计算机现在我们大概明白了NAPT如何实现内网计算机和外网主机间的透明通讯。现在来看一下我们最关心的问题，就是NAPT是依据什么策略æ¥判断是否要为一个请求发出的UDP数据包建立Session的呢？主要有一下几个策略:
+
+A. 源地址(内网IP地址)不同，忽略其它因素, 在NAPT上肯定对应不同的Session B. 源地址(内网IP地址)相同，源端口不同，#include "windows.h"PT上也肯定对应不同的Session C. 源地址(内网IP地址)相同，源端口相同，目的地址(公网IP地址)相同，目的端口不同，则在NAPT上肯定对应同一个Session D. 源地址(内网IP地址)相å，源端口相同，目的地址(公网IP地址)不同，忽略目的端口，则在NAPT上是如何处理Session的呢？
+
+D的情况正式我们关心和要讨论的问题。依据目的地址(公网IP地址)对于Session的建立的决定方式我们将NAPT设备划分为两大类:
+
+Symmetric NAPT: 对于到同一个IP地址，任意端口的连接分配使用同一个Session; 对于到不同的IP地址, 任意端口的连接使用不同的Session. 我们称此种NAPT为 Symmetric NAPT. 也就是只要本地绑定的UDP端口相同， 发出的目的IP地址不同，则会建立不同的Session.
+
+
+图六: Symmetric 的英文意思是对称。多个端口对应多个主机，平行的，对称的!
+
+Cone NAPT: 对于到同一个IP地址，任意端口的连接分配使用同一个Session; 对于到不同的IP地址，任意端口的连接也使用同一个Session. 我们称此种NAPT为 Cone NAPT. 也就是只要本地绑定的UDP端口相同， 发出的目的地址不管是否相同， 都使用同一个Session.
+
+
+图七: Cone 的英文意思是锥。一个端口对应多个主机，是不是像个锥子?
+
+现在绝大多数的NAPT属于后者，即Cone NAT。本人在测试的过程中，只好使用了一台日本的Symmetric NAT。还好不是自己的买的，我从不买日货, 希望看这篇文章的朋友也自觉的不要购买日本的东西。Win9x/2K/XP/2003系统自带的NAPT也是属于 Cone NAT的。这是值的庆幸的，因为我们要做的UDP穿透只能在Cone NAT间进行，只要有一台不是Cone NAT，对不起，UDP穿透没有希望了，服务器转发吧。后面会做详细分析!
+
+下面我们再来分析一下NAPT 工作时的一些数据结构，在这里我们将真正说明UDP可以穿透Cone NAT的依据。这里描述的数据结构只是为了说明原理，不具有实际参考价值，真正感兴趣可以阅读Linux的中关于NAT实现部分的源码。真正的NAT实现也没有利用数据库的，呵呵，为了速度！
+
+Symmetric NAPT 工作时的端口映射数据结构如下:
+
+内网信息表:
+
+[NAPT 分配端口] [ 内网IP地址 ] [ 内网端口 ] [ 外网IP地址 ] [ SessionTime 开始时间 ]
+
+PRIMARY KEY( [NAPT 分配端口] ) -> 表示依据[NAPT 分配端口]建立主键，必须唯一且建立索引，加快查找. UNIQUE( [ 内网IP地址 ], [ 内网端口 ] ) -> 表示这两个字段联合起来不能重复. UNIQUE( [ 内网IP地址 ], [ 内网端口 ], [ 外网IP地址 ] ) -> 表示这三个字段联合起来不能重复.
+
+映射表:
+
+[NAPT 分配端口] [ 外网端口 ]
+
+UNIQUE( [NAPT 分配端口], [ 外网端口 ] ) -> 表示这两个字段联合起来不能重复.
+
+Cone NAPT 工作时的端口映射数据结构如下:
+
+内网信息表:
+
+[NAPT 分配端口] [ 内网IP地址 ] [ 内网端口 ] [ SessionTime 开始时间 ]
+
+PRIMARY KEY( [NAPT 分配端口] ) -> 表示依据[NAPT 分配端口]建立主键，必须唯一且建立索引，加快查找. UNIQUE( [ 内网IP地址 ], [ 内网端口 ] ) -> 表示这两个字段联合起来不能重复.
+
+外网信息表:
+
+[ wid 主键标识 ] [ 外网IP地址 ] [ 外网端口 ]
+
+PRIMARY KEY( [ wid 主键标识 ] ) -> 表示依据[ wid 主键标识 ]建立主键，必须唯一且建立索引，加快查找. UNIQUE( [ 外网IP地址 ], [ 外网端口 ] ) -> 表示这两个字段联合起来不能重复.
+
+映射表: 实现一对多，的
+
+[NAPT 分配端口] [ wid 主键标识 ]
+
+UNIQUE( [NAPT 分配端口], [ wid 主键标识 ] ) -> 表示这两个字段联合起来不能重复. UNIQUE( [ wid 主键标识 ] ) -> 标识此字段不能重复.
+
+看完了上面的数据结构是更明白了还是更晕了？ 呵呵! 多想一会儿就会明白了。通过NAT,内网计算机计算机向外连结是很容易的，NAPT会自动处理，我们的应用程序根本不必关心它是如何处理的。那么外部的计算机想访问内网中的计算机如何实现呢？我们来看一下下面的流程：
+
+c 是一台在NAPT后面的内网计算机，s是一台有外网IP地址的计算机。c 主动向 s 发起连接请求，NAPT依据上面描述的规则在自己的数据结构中记录下来，建立一个Session. 然后 c 和 s 之间就可以实现双向的透明的数据传输了。如下面所示:
+
+ c[192.168.0.6:1827] <-> [priv ip: 192.168.0.1]NAPT[pub ip: 61.51.99.86:9881] <-> s[61.51.76.102:8098]
+由此可见，一台外网IP地址的计算机想和NAPT后面的内网计算机通讯的条件就是要求NAPT后面的内网计算机主动向外网IP地址的计算机发起一个UDP数据包。外网IP地址的计算机利用收到的UDP数据包获取到NAPT的外网IP地址和映射的端口，以后就可以和内网IP的计算机透明的进行通讯了。
+
+现在我们再来分析一下我们最关心的两个NAPT后面的内网计算机如何实现直接通讯呢? 两者都无法主动发出连接请求，谁也不知道对方的NAPT的公网IP地址和NAPT上面映射的端口号。所以我们要靠一个公网IP地址的服务器帮助两者来建立连接。当两个NAPT后面的内网计算机分别连接了公网IP地址的服务器后，服务器可以从收到的UDP数据包中获取到这两个NAPT设备的公网IP地址和这两个连接建立的Session的映射端口。两个内网计算机可以从服务器上获取到对方的NAPT设备公网IP地址和映射的端口了。
+
+我们假设两个内网计算机分别为A和B，对应的NAPT分别为AN和 BN， 如果A在获取到B对应的BN的IP地址和映射的端口后，迫不急待的向这个IP 地址和映射的端口发送了个UDP数据包，会有什么情况发生呢？依据上面的原理和数据结构我们会知道，AN会在自己的数据结构中生成一条记录，标识一个新Session的存在。BN在收到数据包后，从自己的数据结构中查询，没有找到相关记录，因此将包丢弃。B是个慢性子，此时才慢吞吞的向着AN的IP地址和映射的端口发送了一个UDP数据包，结果如何呢？当然是我们期望的结构了，AN在收到数据包后，从自己的数据结构中查找到了记录，所以将数据包进行处理发送给了A。A 再次向B发送数据包时，一切都时畅通无阻了。OK, 大工告成！且慢，这时对于Cone NAPT而言，对于Symmetric NAPT呢？呵呵，自己分析一下吧...
+
+NAPT(The IP Network Address/Port Translator) 进行UDP穿透的具体情况分析!
+
+首先明确的将NAPT设备按照上面的说明分为: Symmetric NAPT 和 Cone NAPT, Cone NAPT 是我们需要的。Win9x/2K/XP/2003 自带的NAPT也为Cone NAPT。
+
+第一种情况, 双方都是Symmetric NAPT:
+
+此情况应给不存在什么问题，肯定是不支持UDP穿透。
+
+第二种情况, 双方都是Cone NAPT:
+
+此情况是我们需要的，可以进行UDP穿透。
+
+第三种情况, 一个是Symmetric NAPT, 一个是Cone NAPT:
+
+此情况比较复杂，但我们按照上面的描述和数据机构进行一下分析也很容易就会明白了, 分析如下,
+
+假设: A -> Symmetric NAT, B -> Cone NAT
+
+1. A 想连接 B, A 从服务器那儿获取到 B 的NAT地址和映射端口, A 通知服务器，服务器告知 B A的NAT地址和映射端口, B 向 A 发起连接，A 肯定无法接收到。此时 A 向 B 发起连接， A 对应的NAT建立了一个新的Session，分配了一个新的映射端口， B 的 NAT 接收到UDP包后，在自己的映射表中查询，无法找到映射项，因此将包丢弃了。
+
+2. B 想连接 A, B 从服务器那儿获取到 A 的NAT地址和映射端口, B 通知服务器, 服务器告知 A B的NAT地址和映射端口,A 向 B 发起连接, A 对应的NAT建立了一个新的Session，分配了一个新的映射端口B肯定无法接收到。此时 B 向 A 发起连接, 由于 B 无法获取 A 建立的新的Session的映射端口，仍是使用服务器上获取的映射端口进行连接， 因此 A 的NAT在接收到UDP包后，在自己的映射表中查询，无法找到映射项, 因此将包丢弃了。
+
+根据以上分析，只有当连接的两端的NAT都为Cone NAT的情况下，才能进行UDP的内网穿透互联。
+
+
+NAPT(The IP Network Address/Port Translator) 进行UDP穿透如何进行现实的验证和分析!
+
+需要的网络结构如下:
+
+三个NAT后面的内网机器，两个外网服务器。其中两台Cone NAPT，一台 Symmetric NAPT。
+
+验证方法:
+
+可以使用本程序提供的源码，编译，然后分别运行服务器程序和客户端。修改过后的源码增加了客户端之间直接通过IP地址和端口发送消息的命令，利用此命令，你可以手动的验证NAPT的穿透情况。为了方便操作，推荐你使用一个远程登陆软件，可以直接在一台机器上操作所有的相关的计算机，这样很方便，一个人就可以完成所有的工作了。呵呵，本人就是这么完成的。欢迎有兴趣和经验的朋友来信批评指正，共同进步。
