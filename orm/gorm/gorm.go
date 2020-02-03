@@ -12,6 +12,8 @@ type Like struct {
 	Ip        string `gorm:"type:varchar(20);not null;index:ip_idx"`
 	Ua        string `gorm:"type:varchar(256);not null;"`
 	Title     string `gorm:"type:varchar(128);not null;index:title_idx"`
+	Uid       uint32 `gorm:"type:int"`
+	Gid       uint32 `gorm:"type:bigint"`
 	Hash      uint64 `gorm:"unique_index:hash_idx;"`
 	CreatedAt time.Time
 }
