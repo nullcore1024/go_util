@@ -1,0 +1,42 @@
+package platform.app.proto;
+
+message app_rtt_rate_req {
+    required int64 seqid            = 1;
+    required int64 uid              = 2; 
+    optional int32 appid            = 3; 
+    required string mnc             = 4; //MNC(移动网络码
+    required string mcc             = 5; //MCC(移动国家码)
+    required string country_code    = 6; //国家码
+}
+
+message sample_rate {
+    required int32 uri  = 1; //协议cmd
+    required int32 rate = 2; //采样率, rate=50,代表50%采样
+    optional int32 expire_second = 3; //采样生效周期(单位秒), 如果没有指定，则使用全局的生效周期 app_rtt_rate_res.global_expire_second
+}
+
+message app_rtt_rate_res {
+    required int64 seqid                 = 1;
+    required int64 uid                   = 2;
+    repeated sample_rate rates           = 3;
+    required int32 global_expire_second  = 4; // 采样生效时间(单位秒)
+    required int32 report_interval_time  = 5; // 上报间隔，单位分钟 
+}
+
+message sample_uri_rtt {
+    required int32 uri                  = 1; //协议cmd
+    required int32 avg_rtt_ms           = 2; //协议耗时(单位毫秒)
+    required int32 proto_send_times     = 3; //统计周期内发送的协议cmd的次数
+}
+
+message app_report_rtt_stat_req {
+    required int64 seqid                = 1;
+    required int64 uid                  = 2;
+    repeated sample_uri_rtt sample      = 3;
+}
+
+message app_report_rtt_stat_res {
+    required int64 seqid                = 1;
+    required int64 uid                  = 2;
+    required int32 res_code             = 3;
+}
