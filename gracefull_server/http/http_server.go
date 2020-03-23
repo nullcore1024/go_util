@@ -109,10 +109,8 @@ func (thiz *Uri_report_sample_config) get_sample_rate_by_country(seqId, uid int6
 		}
 		return true
 	}
-	var expire int32 = int32(thiz.Expire.Seconds())
-	var report int32 = int32(thiz.Report_interval_time.Minutes())
-	res.GlobalExpireSecond = &expire
-	res.ReportIntervalTime = &report
+	*res.GlobalExpireSecond = int32(thiz.Expire.Seconds())
+	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Minutes())
 	return false
 }
 
@@ -148,10 +146,8 @@ func (thiz *Uri_report_sample_config) get_sample_all_rate(seqId, uid int64, appI
 		}).Info("pull_rtt_rate uriRate")
 	}
 
-	var expire int32 = int32(thiz.Expire.Seconds())
-	var report int32 = int32(thiz.Report_interval_time.Minutes())
-	res.GlobalExpireSecond = &expire
-	res.ReportIntervalTime = &report
+	*res.GlobalExpireSecond = int32(thiz.Expire.Seconds())
+	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Minutes())
 	return true
 }
 
@@ -181,7 +177,7 @@ func pull_rtt_rate_json(w http.ResponseWriter, r *http.Request) {
 	err := json.Unmarshal(body, &req)
 	if err != nil {
 		log.Error("unmarshal fail", err)
-		w.Write([]byte("format err"))
+		w.Write([]byte("format err" + err.Error()))
 		return
 	}
 
@@ -191,8 +187,10 @@ func pull_rtt_rate_json(w http.ResponseWriter, r *http.Request) {
 	}).Debug("pull_rtt_rate_json")
 
 	res := App_rtt_rate_res{
-		Seqid: req.Seqid,
-		Uid:   req.Uid,
+		Seqid:              req.Seqid,
+		Uid:                req.Uid,
+		GlobalExpireSecond: new(int32),
+		ReportIntervalTime: new(int32),
 	}
 	SampleConfig.get_sample_rate_by_uid(req.GetSeqid(), req.GetUid(), req.GetAppid(), req.GetMnc(), req.GetMcc(), req.GetCountryCode(), &res)
 	log.Debug("res rates size ", len(res.Rates))
@@ -207,7 +205,7 @@ func pull_rtt_rate(w http.ResponseWriter, r *http.Request) {
 	err := pb.Unmarshal(body, &req)
 	if err != nil {
 		log.Error("pb unmarshal fail", err)
-		w.Write([]byte("format err"))
+		w.Write([]byte("format err" + err.Error()))
 		return
 	}
 
@@ -217,16 +215,28 @@ func pull_rtt_rate(w http.ResponseWriter, r *http.Request) {
 	}).Debug("pull_rtt_rate")
 
 	res := App_rtt_rate_res{
-		Seqid: req.Seqid,
-		Uid:   req.Uid,
+		Seqid:              req.Seqid,
+		Uid:                req.Uid,
+		GlobalExpireSecond: new(int32),
+		ReportIntervalTime: new(int32),
 	}
 	SampleConfig.get_sample_rate_by_uid(req.GetSeqid(), req.GetUid(), req.GetAppid(), req.GetMnc(), req.GetMcc(), req.GetCountryCode(), &res)
 	log.Debug("res rates size ", len(res.Rates))
 	if wdata, err := pb.Marshal(&res); err == nil {
 		w.Write([]byte(wdata))
 		log.Debug("res data size:", len(wdata))
+
+		var rr App_rtt_rate_res
+		err := pb.Unmarshal(wdata, &rr)
+		if err != nil {
+			log.Error("pb xxxx unmarshal fail", err)
+		} else {
+			log.Info("pb xxxx unmarshal ok")
+		}
+
 	} else {
-		log.Debug("pb mrashal error:", err)
+		w.Write([]byte(err.Error()))
+		log.Debug("pull_rtt_rate pb mrashal error:", err)
 	}
 }
 
@@ -349,7 +359,7 @@ func report_uri_stat_json(w http.ResponseWriter, r *http.Request) {
 	err := json.Unmarshal(body, &req)
 	if err != nil {
 		log.Error("unmarshal fail", err)
-		w.Write([]byte("format err"))
+		w.Write([]byte("format err" + err.Error()))
 		return
 	}
 
@@ -377,7 +387,7 @@ func report_uri_stat(w http.ResponseWriter, r *http.Request) {
 	err := pb.Unmarshal(body, &req)
 	if err != nil {
 		log.Error("unmarshal fail", err)
-		w.Write([]byte("format err"))
+		w.Write([]byte("format err" + err.Error()))
 		return
 	}
 
