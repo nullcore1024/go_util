@@ -12,7 +12,7 @@ message app_rtt_rate_req {
 message sample_rate {
     required int32 uri  = 1; //协议cmd
     required int32 rate = 2; //采样率, rate=50,代表50%采样
-    optional int32 expire_second = 3; //采样生效周期(单位秒), 如果没有指定，则使用全局的生效周期 app_rtt_rate_res.global_expire_second
+    required int32 expire_second = 3; //采样生效周期(单位秒), 如果没有指定，则使用全局的生效周期 app_rtt_rate_res.global_expire_second
 }
 
 message app_rtt_rate_res {
