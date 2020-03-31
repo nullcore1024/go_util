@@ -3,11 +3,15 @@ package main
 import (
 	proto "./platform_app_proto"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/fvbock/endless"
 	pb "github.com/golang/protobuf/proto"
 	"github.com/gorilla/mux"
+	"github.com/influxdata/influxdb1-client/v2"
+	"github.com/jinzhu/gorm"
+	_ "github.com/jinzhu/gorm/dialects/mysql"
 	"github.com/lestrrat-go/file-rotatelogs"
 	"github.com/rifflock/lfshook"
 	log "github.com/sirupsen/logrus"
@@ -19,8 +23,25 @@ import (
 	"time"
 )
 
-var addr = flag.String("addr", ":8080", "http service address")
-var configFile = flag.String("conf", "configFile.json", "app uri rate config")
+const (
+	MyDB          = "app_stats"
+	username      = "influx"
+	password      = "123456"
+	MyMeasurement = "app_uri_rtt_stats"
+)
+
+var (
+	dbname        = flag.String("database", "appstats", "db database")
+	dbuser        = flag.String("dbuser", "root", "db user")
+	dbpwd         = flag.String("pwd", "sql123", "user passwd")
+	dbAddr        = flag.String("db", "127.0.0.1:3306", "db address and port")
+	addr          = flag.String("addr", ":8090", "http service address")
+	configFile    = flag.String("conf", "configFile.json", "app uri rate config")
+	influxAddr    = flag.String("influxAddr", "http://127.0.0.1:8086", "influx server address")
+	DbNotInit     = errors.New("db not init")
+	DbErr         = errors.New("db insert fail")
+	InfluxNotInit = errors.New("influx not init")
+)
 
 type (
 	App_rtt_rate_req        = proto.AppRttRateReq
@@ -36,8 +57,10 @@ type Uri_report_sample_config struct {
 	UriRate              map[int32]Sample_rate
 	CountryCodeUriRate   map[string][]Sample_rate
 	Expire               time.Duration `json:"expire_second"`
-	Report_interval_time time.Duration `json:"report_interval_minute"`
+	Report_interval_time time.Duration `json:"report_interval_second"`
 	Rate                 int32         `json: "uid_rate"`
+	db                   *gorm.DB
+	influxClient         client.Client
 }
 
 var SampleConfig Uri_report_sample_config
@@ -52,23 +75,60 @@ func init() {
 		CountryCodeUriRate:   make(map[string][]Sample_rate),
 		Rate:                 50,
 		Expire:               time.Hour * 1,
-		Report_interval_time: time.Minute * 5,
+		Report_interval_time: time.Second * 60,
 	}
 	SampleConfig.Load(*configFile)
-	/*
-		rand.Seed(time.Now().UnixNano())
-		setUri := []int32{19, 23, 1001, 4001, 5005, 5007}
-		for i, _ := range setUri {
-			rate := int32(rand.Intn(100))
-			sample := Sample_rate{
-				Uri:  &setUri[i],
-				Rate: &rate,
-			}
-			SampleConfig.UriRate[*sample.Uri] = sample
-		}
-	*/
+}
 
-	//SampleConfig.Dump(*configFile)
+func (thiz *Uri_report_sample_config) InitInflux() error {
+	client, err := connInflux()
+	if err != nil {
+		return err
+	}
+	thiz.influxClient = client
+	return nil
+}
+
+func connInflux() (client.Client, error) {
+	cli, err := client.NewHTTPClient(client.HTTPConfig{
+		Addr:     *influxAddr,
+		Username: username,
+		Password: password,
+	})
+	return cli, err
+}
+
+func (thiz *Uri_report_sample_config) InitDB() error {
+	var err error
+	//thiz.db, err = gorm.Open("mysql", fmt.Sprintf("%s:%s@(127.0.0.1:3306)/%s?charset=utf8&parseTime=True&loc=Local", *dbuser, *dbpwd, *dbname))
+	thiz.db, err = gorm.Open("mysql", fmt.Sprintf("%s:%s@(%s)/%s?charset=utf8&parseTime=True&loc=Local", *dbuser, *dbpwd, *dbAddr, *dbname))
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	if !thiz.db.HasTable(&AppStatsItem{}) {
+		if err := thiz.db.Set("gorm:table_options", "ENGINE=InnoDB DEFAULT CHARSET=utf8").CreateTable(&AppStatsItem{}).Error; err != nil {
+			log.Error(err)
+			return err
+		}
+	}
+	thiz.db.LogMode(true)
+	thiz.db.DB().SetMaxIdleConns(10)
+	thiz.db.DB().SetMaxOpenConns(100)
+	return nil
+}
+
+type AppStatsItem struct {
+	//Id             int32  `gorm:"type:bigint;primary_key;AUTO_INCREMENT"`
+	Seqid          int64  `gorm: "type:bigint"`
+	Appid          int32  `gorm: "type:smallint; index:appid_idx"`
+	Uid            int64  `gorm: "type:bigint"`
+	ClientType     string `gorm: "type:varchar(32); index:client_type_idx"`
+	Uri            int32  `gorm: "type:int; index: uri_idx"`
+	Version        string `gorm: "type:varcha(32); index: version_idx"`
+	AvgRttMs       int32  `gorm: "type:int"`
+	ProtoSendTimes int32  `gorm: "type:smallint"`
 }
 
 func (thiz *Uri_report_sample_config) Load(file string) error {
@@ -110,7 +170,7 @@ func (thiz *Uri_report_sample_config) get_sample_rate_by_country(seqId, uid int6
 		return true
 	}
 	*res.GlobalExpireSecond = int32(thiz.Expire.Seconds())
-	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Minutes())
+	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Seconds())
 	return false
 }
 
@@ -147,25 +207,139 @@ func (thiz *Uri_report_sample_config) get_sample_all_rate(seqId, uid int64, appI
 	}
 
 	*res.GlobalExpireSecond = int32(thiz.Expire.Seconds())
-	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Minutes())
+	*res.ReportIntervalTime = int32(thiz.Report_interval_time.Seconds())
 	return true
+}
+
+//Insert
+func WritesPoints(cli client.Client, table string, tags map[string]string, fields map[string]interface{}) error {
+	if cli == nil {
+		return InfluxNotInit
+	}
+	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:  MyDB,
+		Precision: "s",
+	})
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	pt, err := client.NewPoint(
+		table,
+		tags,
+		fields,
+		time.Unix(time.Now().Unix(), 0),
+	)
+	log.Debug("")
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+	pt.PrecisionString("ms")
+	bp.AddPoint(pt)
+
+	if err := cli.Write(bp); err != nil {
+		log.Error(err)
+		return err
+	}
+	return nil
+}
+
+func (thiz *Uri_report_sample_config) WritesPoints(table string, req *App_report_rtt_stat_req) error {
+	var err error
+	for _, v := range req.Sample {
+		log.WithFields(log.Fields{
+			"Appid":      req.GetAppid(),
+			"Version":    req.GetVersion(),
+			"clientType": req.GetClientType(),
+			"Uri":        v.GetUri(),
+			"avgRttMs":   v.GetAvgRttMs(),
+			"sendTimes":  v.GetProtoSendTimes(),
+		}).Info("save_sample_rtt_stat")
+
+		tags := map[string]string{
+			"Appid":      fmt.Sprintf("%d", req.GetAppid()),
+			"Version":    req.GetVersion(),
+			"clientType": req.GetClientType(),
+			"Uri":        fmt.Sprintf("%d", v.GetUri()),
+		}
+		fields := map[string]interface{}{
+			"avgRttMs":  v.GetAvgRttMs(),
+			"sendTimes": v.GetProtoSendTimes(),
+		}
+		log.Debug("dump tags", tags)
+
+		log.WithFields(log.Fields(fields)).Debug("dump fields")
+
+		err = WritesPoints(thiz.influxClient, table, tags, fields)
+		if err != nil {
+			log.Error("write fail", err)
+		}
+	}
+	return err
+}
+
+func (thiz *Uri_report_sample_config) save_db(req *App_report_rtt_stat_req) error {
+	if thiz.db == nil {
+		return DbNotInit
+	}
+	var err error
+	for _, v := range req.Sample {
+		log.WithFields(log.Fields{
+			"Seqid":      req.GetSeqid(),
+			"Uid":        req.GetUid(),
+			"ClientType": req.GetClientType(),
+			"Version":    req.GetVersion(),
+			"Uri":        v.GetUri(),
+			"avgRttMs":   v.GetAvgRttMs(),
+			"sendTimes":  v.GetProtoSendTimes(),
+		}).Info("save_sample_rtt_stat to db")
+
+		item := &AppStatsItem{
+			Seqid:          req.GetSeqid(),
+			Appid:          req.GetAppid(),
+			Uid:            req.GetUid(),
+			ClientType:     req.GetClientType(),
+			Version:        req.GetVersion(),
+			Uri:            v.GetUri(),
+			AvgRttMs:       v.GetAvgRttMs(),
+			ProtoSendTimes: v.GetProtoSendTimes(),
+		}
+		err := thiz.db.Create(item)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"err": err,
+			}).Error("save_sample_rtt_stat to db error")
+		}
+	}
+	return err
 }
 
 func (thiz *Uri_report_sample_config) save_sample_rtt_stat(req *App_report_rtt_stat_req) error {
 	log.WithFields(log.Fields{
-		"Seqid": req.Seqid,
-		"Uid":   req.Uid,
-	}).Debug("save_sample_rtt_stat")
+		"Seqid":      req.GetSeqid(),
+		"Uid":        req.GetUid(),
+		"Appid":      req.GetAppid(),
+		"Version":    req.GetVersion(),
+		"clientType": req.GetClientType(),
+		"size":       len(req.Sample),
+	}).Info("save_sample_rtt_stat")
 
 	for _, v := range req.Sample {
 		log.WithFields(log.Fields{
-			"Seqid":     req.Seqid,
-			"Uid":       req.Uid,
-			"Uri":       v.Uri,
-			"avgRttMs":  v.AvgRttMs,
-			"sendTimes": v.ProtoSendTimes,
-		}).Debug("save_sample_rtt_stat")
+			"Seqid":      req.GetSeqid(),
+			"Appid":      req.GetAppid(),
+			"Uid":        req.GetUid(),
+			"Version":    req.GetVersion(),
+			"clientType": req.GetClientType(),
+			"Uri":        v.GetUri(),
+			"avgRttMs":   v.GetAvgRttMs(),
+			"sendTimes":  v.GetProtoSendTimes(),
+		}).Info("save_sample_rtt_stat")
 	}
+	thiz.save_db(req)
+	thiz.WritesPoints(MyMeasurement, req)
 	return nil
 }
 
@@ -225,15 +399,6 @@ func pull_rtt_rate(w http.ResponseWriter, r *http.Request) {
 	if wdata, err := pb.Marshal(&res); err == nil {
 		w.Write([]byte(wdata))
 		log.Debug("res data size:", len(wdata))
-
-		var rr App_rtt_rate_res
-		err := pb.Unmarshal(wdata, &rr)
-		if err != nil {
-			log.Error("pb xxxx unmarshal fail", err)
-		} else {
-			log.Info("pb xxxx unmarshal ok")
-		}
-
 	} else {
 		w.Write([]byte(err.Error()))
 		log.Debug("pull_rtt_rate pb mrashal error:", err)
@@ -342,8 +507,10 @@ func dump_uri_rate(w http.ResponseWriter, r *http.Request) {
 	)
 
 	res := App_rtt_rate_res{
-		Seqid: &Seqid,
-		Uid:   &Uid,
+		Seqid:              &Seqid,
+		Uid:                &Uid,
+		GlobalExpireSecond: new(int32),
+		ReportIntervalTime: new(int32),
 	}
 
 	SampleConfig.get_sample_all_rate(res.GetSeqid(), res.GetUid(), 0, "", "", "", &res)
@@ -365,15 +532,12 @@ func report_uri_stat_json(w http.ResponseWriter, r *http.Request) {
 
 	SampleConfig.save_sample_rtt_stat(&req)
 
-	log.WithFields(log.Fields{
-		"Seqid": req.Seqid,
-		"Uid":   req.Uid,
-	}).Debug("report_uri_stat")
-
 	var code int32 = 200
 	res := App_report_rtt_stat_res{
 		Seqid:   req.Seqid,
 		Uid:     req.Uid,
+		Appid:   req.Appid,
+		Version: req.Version,
 		ResCode: &code,
 	}
 	json.NewEncoder(w).Encode(&res)
@@ -393,25 +557,31 @@ func report_uri_stat(w http.ResponseWriter, r *http.Request) {
 
 	SampleConfig.save_sample_rtt_stat(&req)
 
-	log.WithFields(log.Fields{
-		"Seqid": req.Seqid,
-		"Uid":   req.Uid,
-	}).Debug("report_uri_stat")
-
 	var code int32 = 200
 	res := App_report_rtt_stat_res{
 		Seqid:   req.Seqid,
 		Uid:     req.Uid,
+		Appid:   req.Appid,
+		Version: req.Version,
 		ResCode: &code,
 	}
 
 	if wdata, err := pb.Marshal(&res); err == nil {
 		w.Write(wdata)
+	} else {
+		w.Write([]byte(err.Error()))
+		log.Error("App_report_rtt_stat_res marshal fail", err)
 	}
 }
 
 func main() {
 	flag.Parse()
+	if err := SampleConfig.InitDB(); err != nil {
+		panic(err)
+	}
+	if err := SampleConfig.InitInflux(); err != nil {
+		log.Error("init influx failed, err:", err.Error())
+	}
 
 	router := mux.NewRouter()
 	router.HandleFunc("/add_uri_rate", add_uri_rate).Methods("GET")
@@ -443,6 +613,7 @@ func NewLfsHook(logName string, rotationTime time.Duration, leastDay uint) log.H
 		panic(err)
 	}
 	log.SetLevel(log.DebugLevel)
+	log.SetReportCaller(true)
 
 	// 可设置按不同level创建不同的文件名
 	lfsHook := lfshook.NewHook(lfshook.WriterMap{

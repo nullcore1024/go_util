@@ -31,12 +31,17 @@ message sample_uri_rtt {
 
 message app_report_rtt_stat_req {
     required int64 seqid                = 1;
-    required int64 uid                  = 2;
-    repeated sample_uri_rtt sample      = 3;
+    required int32 appid                = 2; //应用appId
+    required string version             = 3; //客户端版本号 2.9.0
+    required int64 uid                  = 4;
+    required string client_type         = 5; //客户端类型， ios, android
+    repeated sample_uri_rtt sample      = 6;
 }
 
 message app_report_rtt_stat_res {
     required int64 seqid                = 1;
     required int64 uid                  = 2;
-    required int32 res_code             = 3;
+    required int32 appid                = 3;
+    required string version             = 4;
+    required int32 res_code             = 5;
 }
