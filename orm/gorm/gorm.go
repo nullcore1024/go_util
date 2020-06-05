@@ -22,12 +22,12 @@ var db *gorm.DB
 
 func add(id int, Ip, Ua, Title string) {
 	user := &Like{ID: id, Ip: Ip, Ua: Ua, Title: Title, Hash: uint64(id)}
-	db.Create(user)
+	fmt.Println("line", db.Create(user).RowsAffected)
 }
 
 func mode(id int) {
 	user := &Like{ID: id}
-	db.Model(user).Update("Title", "mode tssss")
+	fmt.Println("update line", db.Model(user).Update("Title", "mode tssss").RowsAffected)
 }
 
 func queryAll() {
