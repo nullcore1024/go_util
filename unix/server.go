@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -8,13 +9,15 @@ import (
 	"os"
 )
 
+var file = flag.String("unix", "/test.sock", "unix path")
+
 func main() {
-	var file string = "test.sock" //用于 unix domain socket 的文件
+	flag.Parse()
 start:
-	lis, err := net.Listen("unix", file) //开始监听
-	if err != nil {                      //如果监听失败，一般是文件已存在，需要删除它
+	lis, err := net.Listen("unix", *file) //开始监听
+	if err != nil {                       //如果监听失败，一般是文件已存在，需要删除它
 		log.Println("UNIX Domain Socket 创 建失败，正在尝试重新创建 -> ", err)
-		err = os.Remove(file)
+		err = os.Remove(*file)
 		if err != nil { //如果删除文件失败 ，要么是权限问题，要么是之前监听不成功，不管是什么 都应该退出程序，不然后面 goto 就死循环了
 			log.Fatalln("删除 sock 文件失败！程序退出 -> ", err)
 		}
