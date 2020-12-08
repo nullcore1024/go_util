@@ -26,7 +26,7 @@ import (
 const (
 	MyDB          = "app_stats"
 	username      = "influx"
-	password      = "123456"
+	password      = "inspire123456"
 	MyMeasurement = "app_uri_rtt_stats"
 )
 
