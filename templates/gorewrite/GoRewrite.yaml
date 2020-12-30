@@ -1,0 +1,8 @@
+spec:
+  - name: result
+    import: gorewritetest
+    typeMap:
+      Type:
+        expr: int64
+      TypeQueue:
+        expr: FIFO
