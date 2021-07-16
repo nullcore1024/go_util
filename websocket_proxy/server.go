@@ -5,28 +5,34 @@ import (
 	"context"
 	"flag"
 	"io"
-	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/fvbock/endless"
+	"github.com/gorilla/mux"
 	websocket "github.com/gorilla/websocket"
+	log "google.golang.org/grpc/grpclog"
 )
 
-const kReadTimeout = time.Second * 3
+const (
+	kReadTimeout = time.Second * 3
+	kUrl         = "/ws"
+)
 
 var (
-	addr = flag.String("addr", "localhost:48080", "http service address")
+	addr = flag.String("addr", "localhost:48080", "websocket service address")
 	peer = flag.String("peer", "localhost:48081", "peer address")
+
+	upgrader = websocket.Upgrader{} // use default options
 )
 
-var upgrader = websocket.Upgrader{} // use default options
-
-func echo(w http.ResponseWriter, r *http.Request) {
+func handler(w http.ResponseWriter, r *http.Request) {
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Print("upgrade:", err)
+		log.Error("upgrade fail, err:", err)
 		return
 	}
 	defer c.Close()
@@ -41,8 +47,8 @@ func echo(w http.ResponseWriter, r *http.Request) {
 		defer wg.Done()
 		for {
 			select {
-			case <-ctx.Done(): //取出值即说明是结束信号
-				log.Println("tcp peer close, time=", time.Now().Unix())
+			case <-ctx.Done():
+				log.Info("tcp peer close, time=", time.Now().Unix())
 				return
 			default:
 			}
@@ -57,13 +63,12 @@ func echo(w http.ResponseWriter, r *http.Request) {
 				if ok && netErr.Timeout() && netErr.Temporary() {
 					continue // no data, not error
 				}
-				log.Printf("tcp read err:%s\n", err)
+				log.Infof("dst read err:%s\n", err)
 				break
 			}
-			log.Printf("dst recv msg:%s\n", buf)
 			err = src.WriteMessage(websocket.TextMessage, buf)
 			if err != nil {
-				log.Println("ws write src err:", err)
+				log.Error("ws write src err:", err)
 				break
 			}
 		}
@@ -73,15 +78,14 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, message, err := c.ReadMessage()
 		if err != nil {
-			log.Println("ws read:", err)
+			log.Error("ws read fail, err:", err)
 			wg.Done()
 			break
 		}
-		log.Printf("recv: %s\n", message)
 		io.Copy(tcpConn, bytes.NewBuffer(message))
 		select {
-		case <-ctx.Done(): //取出值即说明是结束信号
-			log.Print("ws peer close, time=", time.Now().Unix())
+		case <-ctx.Done():
+			log.Info("ws peer close, time=", time.Now().Unix())
 			wg.Done()
 			return
 		default:
@@ -93,7 +97,11 @@ func echo(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
-	log.SetFlags(0)
-	http.HandleFunc("/echo", echo)
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	log.SetLoggerV2(log.NewLoggerV2(os.Stdout, os.Stdout, os.Stdout))
+	mux := mux.NewRouter()
+	mux.HandleFunc(kUrl, handler)
+	err := endless.ListenAndServe(*addr, mux)
+	if err != nil {
+		log.Error(err)
+	}
 }
